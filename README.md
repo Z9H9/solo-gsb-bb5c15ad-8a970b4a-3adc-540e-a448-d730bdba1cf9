@@ -50,6 +50,7 @@ DATABASE_PATH=./hydroponic.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/recipes/{id}/versions` | 某配方的全部版本 |
 | GET | `/api/recipes/{id}/versions/{v}` | 读取某版本完整内容（请求 + 结果） |
 | GET | `/api/recipes/{id}/versions/{v}/export` | **导出该版本 JSON 文件** |
+| POST | `/api/irrigation/plan` | **灌溉计划**：按 IANA 时区生成逐日执行批次（DST/跨午夜/容量校验） |
 | GET | `/health` | 健康检查 |
 
 ### 单位约定
@@ -182,17 +183,153 @@ curl -s http://localhost:8000/api/recipes/1/versions/1
 curl -s -OJ http://localhost:8000/api/recipes/1/versions/1/export
 ```
 
+## 灌溉计划（POST /api/irrigation/plan）
+
+给定 **IANA 时区**、日期范围、每日若干开始时间与持续分钟数、每次目标水量以及设备**每日容量**，服务生成逐日执行批次，并处理好三件麻烦事：
+
+- **跨午夜**：批次用真实流逝时间的 UTC 区间表示，结束时间落在次日也能正确显示；
+- **夏令时**：春季跳变时**不存在的本地时间**自动顺延（如纽约 `02:30` 缺失 → `03:30 EDT`，批次上标注 `dst_event: "gap"`）；秋季回拨时**重复的本地时间**取第一次出现（`"duplicate"`，并说明第二次出现的 UTC 偏移）；
+- **合并与容量**：按 UTC 开始时间排序，相邻且**间隔 ≤ 1 分钟（含重叠）**的批次合并（合并可以跨越午夜）；每日容量按**合并前**当日计划总水量校验，超出的日期返回**明确缺口**（`shortfall_ml`），批次照常返回、**绝不截断水量**。
+
+### 请求
+
+```bash
+curl -s http://localhost:8000/api/irrigation/plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "timezone": "Asia/Shanghai",
+    "start_date": "2026-05-01",
+    "end_date": "2026-05-03",
+    "sessions": [
+      {"start_time": "08:00",     "duration_minutes": 10, "water_ml": 500},
+      {"start_time": "08:10:30",  "duration_minutes": 5,  "water_ml": 200},
+      {"start_time": "23:55",     "duration_minutes": 10, "water_ml": 300}
+    ],
+    "daily_capacity_ml": 1100
+  }'
+```
+
+字段说明：
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `timezone` | IANA 时区名（如 `Asia/Shanghai`、`America/New_York`、`Europe/London`）；非法名称返回 422 |
+| `start_date` / `end_date` | 本地日历日期，含首尾；范围最多 370 天，`end < start` 返回 422 |
+| `sessions[].start_time` | 每日重复的本地开始时间 `HH:MM` 或 `HH:MM:SS`（24 小时制）；同一日时间不可重复 |
+| `sessions[].duration_minutes` | 持续分钟数，必须为正；批次按真实流逝时间结束，可自然跨过午夜与 DST 跳变 |
+| `sessions[].water_ml` | 本次目标水量 (mL)，必须为正 |
+| `daily_capacity_ml` | 设备每日供水容量 (mL)，非负（`0` 表示当日不可供水，必然产生缺口） |
+
+### 响应（节选）
+
+`08:00` 的批次在 `08:10` 结束，与 `08:10:30` 开始的批次只隔 30 秒（≤ 1 分钟），被合并成一个 700 mL、`08:00–08:15:30` 的批次；`23:55` 的批次跨到次日 `00:05`：
+
+```json
+{
+  "timezone": "Asia/Shanghai",
+  "start_date": "2026-05-01",
+  "end_date": "2026-05-03",
+  "days": 3,
+  "batch_count_before_merge": 9,
+  "batch_count_after_merge": 6,
+  "merge_gap_seconds": 60,
+  "planned_water_ml": 3000.0,
+  "daily_capacity_ml": 1100,
+  "capacity_ok": true,
+  "capacity_violations": [],
+  "day_results": [
+    {
+      "date": "2026-05-01",
+      "batch_count_before_merge": 3,
+      "batch_count_after_merge": 2,
+      "planned_water_ml": 1000.0,
+      "daily_capacity_ml": 1100,
+      "within_capacity": true,
+      "shortfall_ml": 0.0,
+      "dst_events": []
+    }
+  ],
+  "batches": [
+    {
+      "start_utc": "2026-05-01T00:00:00Z",
+      "end_utc": "2026-05-01T00:15:30Z",
+      "local_start": "2026-05-01T08:00:00+0800",
+      "local_end": "2026-05-01T08:15:30+0800",
+      "duration_seconds": 930,
+      "water_ml": 700.0,
+      "merged": true,
+      "batch_count_before_merge": 2,
+      "dst_event": null,
+      "crosses_midnight": false,
+      "sources": [
+        {"day": "2026-05-01", "requested_time": "08:00:00",
+         "local_start": "2026-05-01T08:00:00+0800", "water_ml": 500.0},
+        {"day": "2026-05-01", "requested_time": "08:10:30",
+         "local_start": "2026-05-01T08:10:30+0800", "water_ml": 200.0}
+      ]
+    },
+    {
+      "start_utc": "2026-05-01T15:55:00Z",
+      "end_utc": "2026-05-01T16:05:00Z",
+      "local_start": "2026-05-01T23:55:00+0800",
+      "local_end": "2026-05-02T00:05:00+0800",
+      "duration_seconds": 600,
+      "water_ml": 300.0,
+      "merged": false,
+      "batch_count_before_merge": 1,
+      "crosses_midnight": true,
+      "sources": [/* ... */]
+    }
+  ]
+}
+```
+
+### 夏令时与容量缺口
+
+纽约 2024-03-10 春季跳变，请求 `02:30` 浇水 30 分钟：该本地时间不存在，批次顺延到 `03:30 EDT`（UTC `07:30Z`）并在批次与 `day_results[].dst_events` 上标注：
+
+```json
+{
+  "start_utc": "2024-03-10T07:30:00Z",
+  "end_utc": "2024-03-10T08:00:00Z",
+  "local_start": "2024-03-10T03:30:00-0400",
+  "dst_event": "gap",
+  "dst_note": "请求的本地时间 2024-03-10T02:30:00 不存在（夏令时跳变，缺失 60 分钟），已顺延到 2024-03-10T03:30:00-04:00 执行。"
+}
+```
+
+当某日计划总量超过 `daily_capacity_ml` 时，接口仍返回 **200**（这是计划结果而非请求错误），并在顶层与每日结果中给出缺口，批次水量保持完整：
+
+```json
+{
+  "capacity_ok": false,
+  "capacity_violations": [
+    {
+      "date": "2026-05-01",
+      "planned_water_ml": 1000.0,
+      "daily_capacity_ml": 900,
+      "shortfall_ml": 100.0,
+      "message": "2026-05-01 计划用水 1000 mL，超出设备日容量 900 mL，缺口 100 mL；批次未截断，请扩容或减少当日批次。"
+    }
+  ]
+}
+```
+
+以下情况一律返回 **422**：非法时区（`Mars/Olympus`、`+08:00`、空串）、日期顺序颠倒或超过 370 天、时间格式非法（`25:00`）、`sessions` 为空或开始时间重复、持续分钟数/水量非正、容量为负、多余字段。
+
 ## 项目结构
 
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由（试算 / 保存 / 版本 / 导出）
+│   ├── main.py       # FastAPI 路由（试算 / 保存 / 版本 / 导出 / 灌溉计划）
 │   ├── solver.py     # minimax LP 建模与无可行解诊断
+│   ├── irrigation.py # 灌溉批次生成：时区/DST 解析、跨午夜、合并、容量校验
 │   ├── models.py     # Pydantic 请求/响应模型
 │   ├── database.py   # SQLite 初始化与配方/版本存取
 │   └── config.py     # 元素清单、默认容差、DB 路径
 ├── Dockerfile
 ├── docker-compose.yml
+├── smoke_test.py     # TestClient 端到端冒烟测试
 └── requirements.txt
 ```

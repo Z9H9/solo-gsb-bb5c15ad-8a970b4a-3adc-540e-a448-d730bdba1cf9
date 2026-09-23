@@ -1,9 +1,16 @@
 """Pydantic request/response models."""
 from __future__ import annotations
 
+from datetime import date, time
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 from .config import DEFAULT_TOLERANCE, ELEMENTS, normalize_element
 
@@ -168,3 +175,153 @@ class RecipeVersion(BaseModel):
     created_at: str
     request: dict
     result: dict
+
+
+# --------------------------------------------------------------------------- #
+# Irrigation planning
+# --------------------------------------------------------------------------- #
+# Planning over an unbounded range would make the response arbitrarily large;
+# a full year + leap slack is far beyond any practical irrigation schedule.
+MAX_PLAN_DAYS = 370
+
+
+class IrrigationSessionInput(BaseModel):
+    """One daily irrigation start in local wall-clock time."""
+
+    start_time: time = Field(
+        ...,
+        description=(
+            "本地开始时间 HH:MM 或 HH:MM:SS（按 timezone 解释，"
+            "可落在前一日 00:00~次日 23:59 的普通一天内；持续到次日即跨午夜）"
+        ),
+    )
+    duration_minutes: float = Field(..., gt=0, description="持续分钟数，必须为正")
+    water_ml: float = Field(..., gt=0, description="本次目标水量 (mL)，必须为正")
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class IrrigationPlanRequest(BaseModel):
+    timezone: str = Field(
+        ...,
+        min_length=1,
+        examples=["Asia/Shanghai"],
+        description="IANA 时区名，如 Asia/Shanghai、America/New_York",
+    )
+    start_date: date = Field(..., description="起始日期（含，本地日历日）")
+    end_date: date = Field(..., description="结束日期（含，本地日历日）")
+    sessions: list[IrrigationSessionInput] = Field(
+        ..., min_length=1, description="每日重复的灌溉开始时段（至少 1 个）"
+    )
+    daily_capacity_ml: float = Field(
+        ..., ge=0, description="设备每日供水容量 (mL)，非负；0 表示当日不可供水"
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, v: str) -> str:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        key = v.strip()
+        if not key:
+            raise ValueError("时区不能为空")
+        try:
+            ZoneInfo(key)
+        except (ZoneInfoNotFoundError, ValueError, OSError) as exc:
+            raise ValueError(
+                f"非法 IANA 时区 '{v}'，例如 Asia/Shanghai、"
+                "Europe/London、America/New_York"
+            ) from exc
+        return key
+
+    @field_validator("sessions")
+    @classmethod
+    def _unique_sessions(cls, v: list[IrrigationSessionInput]) -> list[IrrigationSessionInput]:
+        seen: set[time] = set()
+        for s in v:
+            if s.start_time in seen:
+                raise ValueError(
+                    f"每日开始时间 {s.start_time.strftime('%H:%M:%S')} 重复"
+                )
+            seen.add(s.start_time)
+        return v
+
+    @model_validator(mode="after")
+    def _validate_range(self) -> "IrrigationPlanRequest":
+        if self.end_date < self.start_date:
+            raise ValueError(
+                "end_date 不能早于 start_date"
+                f"（{self.start_date.isoformat()} > "
+                f"{self.end_date.isoformat()}）"
+            )
+        span = (self.end_date - self.start_date).days + 1
+        if span > MAX_PLAN_DAYS:
+            raise ValueError(
+                f"日期范围最多 {MAX_PLAN_DAYS} 天，当前 {span} 天"
+            )
+        return self
+
+
+class PlanSessionRef(BaseModel):
+    """A constituent session occurrence inside a (possibly merged) batch."""
+
+    day: str
+    requested_time: str
+    local_start: str
+    dst_event: Optional[str] = None
+    dst_note: Optional[str] = None
+    water_ml: float
+
+
+class IrrigationBatch(BaseModel):
+    start_utc: str = Field(..., description="批次 UTC 开始时间 RFC3339")
+    end_utc: str = Field(..., description="批次 UTC 结束时间 RFC3339")
+    local_start: str = Field(..., description="本地显示开始时间（含 UTC 偏移）")
+    local_end: str = Field(..., description="本地显示结束时间（含 UTC 偏移）")
+    duration_seconds: int
+    water_ml: float = Field(..., description="合并后总水量；超容也不截断")
+    merged: bool
+    batch_count_before_merge: int
+    dst_event: Optional[str] = Field(
+        None, description="gap=夏令时缺失本地时间（已顺延）；duplicate=重复本地时间"
+    )
+    dst_note: Optional[str] = None
+    crosses_midnight: bool
+    sources: list[PlanSessionRef]
+
+
+class CapacityViolation(BaseModel):
+    date: str
+    planned_water_ml: float
+    daily_capacity_ml: float
+    shortfall_ml: float = Field(..., description="明确缺口 = 计划水量 - 日容量")
+    message: str
+
+
+class IrrigationDayResult(BaseModel):
+    date: str
+    batch_count_before_merge: int
+    batch_count_after_merge: int
+    planned_water_ml: float
+    daily_capacity_ml: float
+    within_capacity: bool
+    shortfall_ml: float
+    dst_events: list[str]
+
+
+class IrrigationPlanResult(BaseModel):
+    timezone: str
+    start_date: str
+    end_date: str
+    days: int
+    batch_count_before_merge: int
+    batch_count_after_merge: int
+    merge_gap_seconds: int
+    planned_water_ml: float
+    daily_capacity_ml: float
+    capacity_ok: bool
+    capacity_violations: list[CapacityViolation]
+    day_results: list[IrrigationDayResult]
+    batches: list[IrrigationBatch]

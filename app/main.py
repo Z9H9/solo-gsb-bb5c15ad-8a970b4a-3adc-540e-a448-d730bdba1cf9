@@ -4,12 +4,16 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from . import database
+from .irrigation import build_plan
 from .models import (
+    IrrigationPlanRequest,
+    IrrigationPlanResult,
     RecipeSummary,
     RecipeVersion,
     SaveRecipeRequest,
@@ -47,6 +51,40 @@ def health() -> dict:
 def trial_solve(req: SolveRequest) -> SolveResult:
     """试算：不入库，返回配比、各元素偏差及不可行原因。"""
     return solve(req)
+
+
+@app.post(
+    "/api/irrigation/plan",
+    response_model=IrrigationPlanResult,
+    tags=["irrigation"],
+    summary="生成逐日灌溉执行批次（时区/DST 感知）",
+)
+def irrigation_plan(req: IrrigationPlanRequest) -> IrrigationPlanResult:
+    """按 IANA 时区把每日重复的灌溉时段展开为 UTC 执行批次。
+
+    - 夏令时**缺失**的本地时间（春季跳变）自动顺延并标注 ``gap``；
+      **重复**的本地时间（秋季回拨）取第一次出现并标注 ``duplicate``。
+    - 跨午夜批次为真实流逝时间区间；按 UTC 开始时间排序，相邻且间隔
+      ≤ 1 分钟（含重叠）的批次合并，合并可跨越午夜。
+    - 每日容量按**合并前**当日计划总水量校验；超出容量的日期在
+      ``capacity_violations`` 中给出明确缺口（``shortfall_ml``），
+      批次照常返回、绝不截断水量。
+    - 非法时区/日期/时间、空时段、重复开始时间、负数等均返回 422。
+    """
+    tz = ZoneInfo(req.timezone)
+    sessions = [
+        (s.start_time, s.start_time.strftime("%H:%M:%S"),
+         s.duration_minutes, s.water_ml)
+        for s in req.sessions
+    ]
+    plan = build_plan(
+        tz=tz,
+        start_date=req.start_date,
+        end_date=req.end_date,
+        sessions=sessions,
+        daily_capacity_ml=req.daily_capacity_ml,
+    )
+    return IrrigationPlanResult(**plan)
 
 
 @app.post(
