@@ -243,4 +243,187 @@ with TestClient(app) as client:
     assert b_row["relative_deviation"] is None
     print("15) untargeted/zero-target handling ok")
 
+    # 16) irrigation: UTC conversion + batch crossing midnight ------------- #
+    irrigation_base = {
+        "timezone": "Asia/Shanghai",
+        "start_date": "2026-09-23",
+        "end_date": "2026-09-24",
+        "sessions": [
+            {"start_time": "06:00", "duration_minutes": 30, "water_ml": 200},
+            {"start_time": "23:30", "duration_minutes": 90, "water_ml": 300},
+        ],
+        "daily_capacity_ml": 1000,
+    }
+    r = client.post("/api/irrigation/plan", json=irrigation_base)
+    assert r.status_code == 200, r.text
+    plan = r.json()
+    assert plan["batches_before_merge"] == 4
+    assert plan["batches_after_merge"] == 4
+    assert plan["capacity_ok"] is True
+    assert len(plan["days"]) == 2
+    assert plan["days"][0]["demand_ml"] == 500
+    assert plan["days"][0]["remaining_ml"] == 500
+    night = [b for b in plan["batches"]
+             if b["start_local"] == "2026-09-23T23:30:00+08:00"][0]
+    # 23:30 CST == 15:30 UTC; 90-minute run ends 01:00 next local day
+    assert night["start_utc"] == "2026-09-23T15:30:00Z", night
+    assert night["end_local"] == "2026-09-24T01:00:00+08:00", night
+    assert night["end_utc"] == "2026-09-23T17:00:00Z", night
+    assert night["duration_minutes"] == 90
+    assert night["merged_sessions"] == 1
+    print("16) irrigation UTC conversion + midnight crossing ok")
+
+    # 17) merge: gap of 1 minute merges; gap of 19 minutes stays separate - #
+    merge_req = {
+        "timezone": "UTC",
+        "start_date": "2026-09-23",
+        "end_date": "2026-09-23",
+        "sessions": [
+            {"start_time": "06:00", "duration_minutes": 30, "water_ml": 100},
+            {"start_time": "06:31", "duration_minutes": 10, "water_ml": 50},
+            {"start_time": "07:00", "duration_minutes": 10, "water_ml": 25},
+        ],
+        "daily_capacity_ml": 1000,
+    }
+    plan = client.post("/api/irrigation/plan", json=merge_req).json()
+    assert plan["batches_before_merge"] == 3
+    assert plan["batches_after_merge"] == 2, plan
+    merged, late = plan["batches"]
+    assert merged["merged_sessions"] == 2
+    assert merged["water_ml"] == 150
+    assert merged["start_local"] == "2026-09-23T06:00:00Z"
+    assert merged["end_local"] == "2026-09-23T06:41:00Z"
+    assert merged["duration_minutes"] == 41
+    assert late["water_ml"] == 25
+    # gap of exactly 2 minutes must NOT merge
+    merge_req["sessions"][1]["start_time"] = "06:32"
+    plan = client.post("/api/irrigation/plan", json=merge_req).json()
+    assert plan["batches_after_merge"] == 3, plan
+    print("17) irrigation merge threshold ok")
+
+    # 18) merge across midnight (two-day range; 23:50 run overlaps the next
+    #     day's 00:05 run) ------------------------------------------------- #
+    cross_req = {
+        "timezone": "UTC",
+        "start_date": "2026-09-23",
+        "end_date": "2026-09-24",
+        "sessions": [
+            {"start_time": "00:05", "duration_minutes": 10, "water_ml": 80},
+            {"start_time": "23:50", "duration_minutes": 20, "water_ml": 100},
+        ],
+        "daily_capacity_ml": 1000,
+    }
+    plan = client.post("/api/irrigation/plan", json=cross_req).json()
+    assert plan["batches_before_merge"] == 4
+    assert plan["batches_after_merge"] == 3, plan
+    span = [b for b in plan["batches"] if b["merged_sessions"] == 2][0]
+    assert span["start_local"] == "2026-09-23T23:50:00Z", span
+    assert span["end_local"] == "2026-09-24T00:15:00Z", span
+    assert span["duration_minutes"] == 25
+    assert span["water_ml"] == 180
+    dates = {s["date"] for s in span["sources"]}
+    assert dates == {"2026-09-23", "2026-09-24"}, span
+    print("18) irrigation cross-midnight merge ok")
+
+    # 19) capacity shortfall is explicit and never truncates batches ------ #
+    cap_req = {
+        "timezone": "UTC",
+        "start_date": "2026-09-23",
+        "end_date": "2026-09-23",
+        "sessions": [
+            {"start_time": "06:00", "duration_minutes": 30, "water_ml": 200},
+            {"start_time": "18:00", "duration_minutes": 90, "water_ml": 300},
+        ],
+        "daily_capacity_ml": 400,
+    }
+    plan = client.post("/api/irrigation/plan", json=cap_req).json()
+    assert plan["capacity_ok"] is False
+    day0 = plan["days"][0]
+    assert day0["demand_ml"] == 500
+    assert day0["shortfall_ml"] == 100
+    assert day0["remaining_ml"] == 0
+    assert day0["within_capacity"] is False
+    # batches are not truncated: full 500 mL is still scheduled
+    assert sum(b["water_ml"] for b in plan["batches"]) == 500
+    assert any("缺口" in w for w in plan["warnings"]), plan["warnings"]
+    print("19) irrigation capacity shortfall reported without truncation")
+
+    # 20) DST spring forward: nonexistent 02:30 shifted to 03:30 ---------- #
+    gap_req = {
+        "timezone": "America/New_York",
+        "start_date": "2026-03-08",
+        "end_date": "2026-03-08",
+        "sessions": [
+            {"start_time": "02:30", "duration_minutes": 30, "water_ml": 100},
+        ],
+        "daily_capacity_ml": 1000,
+    }
+    plan = client.post("/api/irrigation/plan", json=gap_req).json()
+    b = plan["batches"][0]
+    # 02:30 does not exist (EST -> EDT skips the hour); folds to 03:30 EDT
+    assert b["start_local"] == "2026-03-08T03:30:00-04:00", b
+    assert b["start_utc"] == "2026-03-08T07:30:00Z", b
+    assert b["sources"][0]["dst_note"] == "nonexistent_shifted_forward"
+    assert any("不存在" in w and "03:30" in w for w in plan["warnings"]), plan["warnings"]
+
+    # 21) DST fall back: ambiguous 01:30 uses the first occurrence (EDT) --- #
+    amb_req = {
+        "timezone": "America/New_York",
+        "start_date": "2026-11-01",
+        "end_date": "2026-11-01",
+        "sessions": [
+            {"start_time": "01:30", "duration_minutes": 30, "water_ml": 100},
+        ],
+        "daily_capacity_ml": 1000,
+    }
+    plan = client.post("/api/irrigation/plan", json=amb_req).json()
+    b = plan["batches"][0]
+    assert b["start_local"] == "2026-11-01T01:30:00-04:00", b
+    assert b["start_utc"] == "2026-11-01T05:30:00Z", b
+    assert b["sources"][0]["dst_note"] == "ambiguous_first_occurrence"
+    assert any("出现两次" in w and "-0400" in w
+               for w in plan["warnings"]), plan["warnings"]
+    print("20/21) DST gap and ambiguity resolved ok")
+
+    # 22) batch spanning the spring-forward transition keeps UTC duration - #
+    span_req = {
+        "timezone": "America/New_York",
+        "start_date": "2026-03-08",
+        "end_date": "2026-03-08",
+        "sessions": [
+            {"start_time": "01:30", "duration_minutes": 90, "water_ml": 100},
+        ],
+        "daily_capacity_ml": 1000,
+    }
+    plan = client.post("/api/irrigation/plan", json=span_req).json()
+    b = plan["batches"][0]
+    assert b["start_local"] == "2026-03-08T01:30:00-05:00", b
+    assert b["end_local"] == "2026-03-08T04:00:00-04:00", b
+    assert b["duration_minutes"] == 90, b
+    print("22) duration stays exact across DST transition ok")
+
+    # 23) invalid input is rejected with 422 ------------------------------- #
+    for bad in [
+        {"timezone": "GMT+8"},
+        {"timezone": "Mars/Olympus"},
+        {"timezone": ""},
+        {"sessions": [
+            {"start_time": "25:00", "duration_minutes": 30, "water_ml": 100}]},
+        {"sessions": [
+            {"start_time": "23:30:30", "duration_minutes": 30, "water_ml": 100}]},
+        {"sessions": [
+            {"start_time": "23:30+08:00", "duration_minutes": 30, "water_ml": 100}]},
+        {"sessions": [
+            {"start_time": "06:00", "duration_minutes": -5, "water_ml": 100}]},
+        {"sessions": [
+            {"start_time": "06:00", "duration_minutes": 30, "water_ml": -1}]},
+        {"daily_capacity_ml": -100},
+        {"start_date": "2026-09-25", "end_date": "2026-09-23"},
+        {"sessions": []},
+        {"unknown_field": 1},
+    ]:
+        payload = {**cap_req, **bad}
+        assert client.post("/api/irrigation/plan", json=payload).status_code == 422, bad
+    print("23) irrigation validation rejects bad input with 422")
+
 print("\nALL SMOKE TESTS PASSED")

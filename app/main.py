@@ -9,7 +9,10 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from . import database
+from .irrigation import build_plan
 from .models import (
+    IrrigationPlanRequest,
+    IrrigationPlanResult,
     RecipeSummary,
     RecipeVersion,
     SaveRecipeRequest,
@@ -31,9 +34,10 @@ app = FastAPI(
     title="水培营养液配比求解 API",
     description=(
         "根据多种浓缩液的元素浓度、可用体积与稀释水约束，"
-        "最小化各元素相对目标配方的最大偏差（minimax LP）。"
+        "最小化各元素相对目标配方的最大偏差（minimax LP）；"
+        "并提供按 IANA 时区展开的灌溉计划接口（跨午夜 / 夏令时安全）。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -47,6 +51,24 @@ def health() -> dict:
 def trial_solve(req: SolveRequest) -> SolveResult:
     """试算：不入库，返回配比、各元素偏差及不可行原因。"""
     return solve(req)
+
+
+@app.post(
+    "/api/irrigation/plan",
+    response_model=IrrigationPlanResult,
+    tags=["irrigation"],
+)
+def irrigation_plan(req: IrrigationPlanRequest) -> IrrigationPlanResult:
+    """灌溉计划：按 IANA 时区生成逐日执行批次。
+
+    - 时长锚定 UTC，跨午夜 / 跨夏令时切换的批次仍精确持续指定分钟数；
+    - 春季拨快导致本地时间不存在时顺延到首个有效时刻，秋季拨回导致本地
+      时间重复时取第一次出现，均在 warnings 中说明；
+    - 按开始时间排序，合并相邻且间隔不超过 1 分钟（含重叠）的批次；
+    - 按本地开始日期核算每日需水与设备容量，容量不足时返回明确缺口，
+      不截断任何批次。
+    """
+    return build_plan(req)
 
 
 @app.post(

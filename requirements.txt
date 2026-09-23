@@ -3,3 +3,6 @@ uvicorn[standard]==0.34.0
 pydantic==2.10.4
 scipy==1.15.0
 numpy==2.2.1
+# IANA timezone database: python:3.11-slim ships no /usr/share/zoneinfo,
+# and zoneinfo falls back to this package inside the Docker image.
+tzdata==2026.4
